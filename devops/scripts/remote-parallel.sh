@@ -29,7 +29,7 @@ SSH_OPTS_PWD=(
   -o PubkeyAuthentication=no
 )
 
-PASSWORDS=("ramos7" "112233")
+PASSWORDS=("Cljslrl0620!" "letsg0" "cljslrl0620")
 
 # Resolved SSH options/passwords (set via resolve_* helpers).
 SSH_OPTS_PORT=()

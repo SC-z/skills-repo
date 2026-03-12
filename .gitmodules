@@ -1,0 +1,3 @@
+[submodule "Ryusuke-stock-analysis"]
+	path = Ryusuke-stock-analysis
+	url = https://github.com/mcs391/Ryusuke-stock-analysis.git

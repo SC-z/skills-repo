@@ -7,19 +7,34 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
+
+
+DEFAULT_ZSTACK_HOST_IPS = [
+    "10.10.20.22",
+    "10.10.20.30",
+    "10.10.20.40",
+]
+DEFAULT_ZSTACK_HOSTS = [f"http://{host}:8080" for host in DEFAULT_ZSTACK_HOST_IPS]
+DEFAULT_ZSTACK_USERNAME = "admin"
+DEFAULT_ZSTACK_PASSWORD = "password"
+HOST_CREDENTIAL_OVERRIDES = {
+    "10.10.20.22": {
+        "password": "letsg9",
+    },
+}
+
+
+class ZStackOpError(Exception):
+    def __init__(self, msg, status=None, body=None):
+        super().__init__(msg)
+        self.msg = msg
+        self.status = status
+        self.body = body
 
 
 def die(msg, status=None, body=None):
-    print(msg, file=sys.stderr)
-    if status is not None:
-        print(f"HTTP status: {status}", file=sys.stderr)
-    if body is not None:
-        try:
-            print(f"Response: {body.decode('utf-8')}", file=sys.stderr)
-        except Exception:
-            print(f"Response (raw): {body}", file=sys.stderr)
-    sys.exit(1)
+    raise ZStackOpError(msg, status=status, body=body)
 
 
 def sha512_hex(value):
@@ -211,15 +226,143 @@ class ZStackClient:
         die("Detach VM NIC failed: no matching endpoint.")
 
 
-def resolve_vm(client, vm_name, vm_uuid):
+def normalize_host(host):
+    host = (host or "").strip()
+    if not host:
+        die("Missing host. Provide --host or ZSTACK_HOST.")
+    if not host.startswith(("http://", "https://")):
+        host = f"http://{host}"
+    parsed = urlparse(host)
+    scheme = parsed.scheme or "http"
+    netloc = parsed.netloc or parsed.path
+    path = parsed.path if parsed.netloc else ""
+    if not netloc:
+        die(f"Invalid host value '{host}'.")
+    if path and path != "/":
+        die(f"Unsupported host format '{host}'; provide only scheme, IP/hostname, and optional port.")
+    host_port = netloc.rsplit("@", 1)[-1]
+    if ":" not in host_port:
+        netloc = f"{netloc}:8080"
+    return f"{scheme}://{netloc}".rstrip("/")
+
+
+def build_client(args, host):
+    parsed = urlparse(host)
+    host_key = (parsed.hostname or "").strip().lower()
+    defaults = {
+        "username": DEFAULT_ZSTACK_USERNAME,
+        "password": DEFAULT_ZSTACK_PASSWORD,
+    }
+    defaults.update(HOST_CREDENTIAL_OVERRIDES.get(host_key, {}))
+    username = args.username or defaults["username"]
+    password = args.password or defaults["password"]
+    if not username:
+        die("Missing username. Set --username or ZSTACK_USERNAME.")
+    if not password:
+        die("Missing password. Set --password or ZSTACK_PASSWORD.")
+    return ZStackClient(
+        host=host,
+        username=username,
+        password=password,
+        timeout=args.timeout,
+        poll_interval=args.poll_interval,
+        wait_timeout=args.wait_timeout,
+        allow_get_fallback=args.allow_get_fallback,
+    )
+
+
+def format_host_error(host, exc):
+    message = f"{host}: {exc.msg}"
+    if exc.status is not None:
+        message += f" (HTTP {exc.status})"
+    return message
+
+
+def connect_clients(args, require_all=False):
+    hosts = [normalize_host(args.host)] if args.host else list(DEFAULT_ZSTACK_HOSTS)
+    clients = []
+    errors = []
+    for host in hosts:
+        client = build_client(args, host)
+        try:
+            client.login()
+        except ZStackOpError as exc:
+            errors.append((host, exc))
+            if args.host:
+                raise
+            continue
+        clients.append((host, client))
+
+    if not clients:
+        details = "\n".join(f"- {format_host_error(host, exc)}" for host, exc in errors)
+        die(f"Unable to connect to any ZStack host.\n{details}")
+
+    if require_all and errors:
+        details = "\n".join(f"- {format_host_error(host, exc)}" for host, exc in errors)
+        hosts_text = ", ".join(DEFAULT_ZSTACK_HOST_IPS)
+        die(
+            "Auto-discovery requires all default ZStack hosts to be reachable before changing VM state or NICs.\n"
+            f"Configured hosts: {hosts_text}\n{details}"
+        )
+
+    return clients, errors
+
+
+def warn_partial_host_errors(errors):
+    if not errors:
+        return
+    print("Warning: skipped unreachable ZStack host(s) during auto-discovery:", file=sys.stderr)
+    for host, exc in errors:
+        print(f"- {format_host_error(host, exc)}", file=sys.stderr)
+
+
+def describe_vm_target(vm_name, vm_uuid):
+    if vm_uuid:
+        return f"VM uuid '{vm_uuid}'"
+    return f"VM '{vm_name}'"
+
+
+def find_vm_matches(client, vm_name, vm_uuid):
     if vm_uuid:
         vm = client.get_vm_by_uuid(vm_uuid)
-        if not vm:
-            die(f"VM uuid '{vm_uuid}' not found.")
-        return vm
+        return [vm] if vm else []
     if not vm_name:
         die("Provide --vm-name or --vm-uuid")
-    return client.get_vm_by_name(vm_name)
+    vms = client.list_vms()
+    return [vm for vm in vms if vm.get("name") == vm_name or vm.get("hostname") == vm_name]
+
+
+def locate_vm_host(args):
+    if not args.vm_name and not args.vm_uuid:
+        die("Provide --vm-name or --vm-uuid")
+    target = describe_vm_target(args.vm_name, args.vm_uuid)
+    clients, _ = connect_clients(args, require_all=not args.host)
+    matches = []
+
+    for host, client in clients:
+        host_matches = find_vm_matches(client, args.vm_name, args.vm_uuid)
+        if len(host_matches) > 1:
+            uuids = [vm.get("uuid") for vm in host_matches]
+            die(f"{target} matched multiple VMs on {host}: {uuids}")
+        if host_matches:
+            matches.append((host, client, host_matches[0]))
+
+    if not matches:
+        hosts_text = ", ".join(DEFAULT_ZSTACK_HOST_IPS) if not args.host else normalize_host(args.host)
+        die(f"{target} not found on host scope: {hosts_text}")
+    if len(matches) > 1:
+        host_list = ", ".join(host for host, _, _ in matches)
+        die(f"{target} exists on multiple ZStack hosts ({host_list}); re-run with --host.")
+    return matches[0]
+
+
+def resolve_vm(client, vm_name, vm_uuid):
+    matches = find_vm_matches(client, vm_name, vm_uuid)
+    if not matches:
+        die(f"{describe_vm_target(vm_name, vm_uuid)} not found.")
+    if len(matches) > 1:
+        die(f"Multiple matches for {describe_vm_target(vm_name, vm_uuid)}: {[vm.get('uuid') for vm in matches]}")
+    return matches[0]
 
 
 def resolve_l3(client, l3_name, l3_uuid):
@@ -236,7 +379,7 @@ def resolve_l3(client, l3_name, l3_uuid):
     return matches[0].get("uuid")
 
 
-def cmd_list(args, client):
+def build_vm_output(args, client, include_host=False):
     vms = client.list_vms(state=args.state)
     l3s = client.list_l3_networks()
     l3_map = {l3.get("uuid"): l3.get("name") for l3 in l3s}
@@ -257,7 +400,13 @@ def cmd_list(args, client):
             "state": vm.get("state"),
             "nics": nics,
         })
-    print(json.dumps(output, ensure_ascii=True, indent=2))
+        if include_host:
+            output[-1]["host"] = client.host
+    return output
+
+
+def cmd_list(args, client):
+    print(json.dumps(build_vm_output(args, client), ensure_ascii=True, indent=2))
 
 
 def resolve_nic(client, vm, nic_uuid, l3_name, l3_uuid):
@@ -277,7 +426,7 @@ def resolve_nic(client, vm, nic_uuid, l3_name, l3_uuid):
     return matches[0]
 
 
-def cmd_list_l3(args, client):
+def build_l3_output(args, client, include_host=False):
     l3s = client.list_l3_networks()
     output = []
     for l3 in l3s:
@@ -296,6 +445,34 @@ def cmd_list_l3(args, client):
             "uuid": l3.get("uuid"),
             "ipRanges": ip_ranges,
         })
+        if include_host:
+            output[-1]["host"] = client.host
+    return output
+
+
+def cmd_list_l3(args, client):
+    print(json.dumps(build_l3_output(args, client), ensure_ascii=True, indent=2))
+
+
+def run_list_vms(args):
+    clients, errors = connect_clients(args, require_all=False)
+    output = []
+    include_host = not args.host
+    for _, client in clients:
+        output.extend(build_vm_output(args, client, include_host=include_host))
+    if include_host:
+        warn_partial_host_errors(errors)
+    print(json.dumps(output, ensure_ascii=True, indent=2))
+
+
+def run_list_l3(args):
+    clients, errors = connect_clients(args, require_all=False)
+    output = []
+    include_host = not args.host
+    for _, client in clients:
+        output.extend(build_l3_output(args, client, include_host=include_host))
+    if include_host:
+        warn_partial_host_errors(errors)
     print(json.dumps(output, ensure_ascii=True, indent=2))
 
 
@@ -306,6 +483,9 @@ def cmd_start(args, client):
         return
     client.start_vm(vm.get("uuid"))
     client.wait_state(vm.get("uuid"), "running")
+    if getattr(args, "selected_host", None):
+        print(f"VM started on {args.selected_host}.")
+        return
     print("VM started.")
 
 
@@ -316,6 +496,9 @@ def cmd_stop(args, client):
         return
     client.stop_vm(vm.get("uuid"), args.type)
     client.wait_state(vm.get("uuid"), "stopped")
+    if getattr(args, "selected_host", None):
+        print(f"VM stopped on {args.selected_host}.")
+        return
     print("VM stopped.")
 
 
@@ -333,11 +516,14 @@ def cmd_add_nic(args, client):
     client.attach_l3(vm_uuid, l3_uuid)
     client.start_vm(vm_uuid)
     vm = client.wait_state(vm_uuid, "running")
-    print(json.dumps({
+    result = {
         "name": vm.get("name"),
         "state": vm.get("state"),
         "vmNics": vm.get("vmNics"),
-    }, ensure_ascii=True, indent=2))
+    }
+    if getattr(args, "selected_host", None):
+        result["host"] = args.selected_host
+    print(json.dumps(result, ensure_ascii=True, indent=2))
 
 
 def cmd_replace_nic(args, client):
@@ -361,11 +547,14 @@ def cmd_replace_nic(args, client):
         client.attach_l3(vm_uuid, to_l3_uuid)
     client.start_vm(vm_uuid)
     vm = client.wait_state(vm_uuid, "running")
-    print(json.dumps({
+    result = {
         "name": vm.get("name"),
         "state": vm.get("state"),
         "vmNics": vm.get("vmNics"),
-    }, ensure_ascii=True, indent=2))
+    }
+    if getattr(args, "selected_host", None):
+        result["host"] = args.selected_host
+    print(json.dumps(result, ensure_ascii=True, indent=2))
 
 
 def cmd_remove_nic(args, client):
@@ -381,16 +570,23 @@ def cmd_remove_nic(args, client):
     client.detach_nic(vm_uuid, nic_uuid)
     client.start_vm(vm_uuid)
     vm = client.wait_state(vm_uuid, "running")
-    print(json.dumps({
+    result = {
         "name": vm.get("name"),
         "state": vm.get("state"),
         "vmNics": vm.get("vmNics"),
-    }, ensure_ascii=True, indent=2))
+    }
+    if getattr(args, "selected_host", None):
+        result["host"] = args.selected_host
+    print(json.dumps(result, ensure_ascii=True, indent=2))
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description="ZStack VM operations")
-    parser.add_argument("--host", default=os.environ.get("ZSTACK_HOST", "http://localhost:8080"))
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("ZSTACK_HOST"),
+        help="ZStack host/IP. If omitted, auto-searches 10.10.20.22, 10.10.20.30, and 10.10.20.40.",
+    )
     parser.add_argument("--username", default=os.environ.get("ZSTACK_USERNAME"))
     parser.add_argument("--password", default=os.environ.get("ZSTACK_PASSWORD"))
     parser.add_argument("--timeout", type=int, default=15)
@@ -454,22 +650,35 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    if not args.username:
-        die("Missing username. Set --username or ZSTACK_USERNAME.")
-    if not args.password:
-        die("Missing password. Set --password or ZSTACK_PASSWORD.")
+    try:
+        if args.command == "list-vms":
+            run_list_vms(args)
+            return
+        if args.command == "list-l3":
+            run_list_l3(args)
+            return
 
-    client = ZStackClient(
-        host=args.host,
-        username=args.username,
-        password=args.password,
-        timeout=args.timeout,
-        poll_interval=args.poll_interval,
-        wait_timeout=args.wait_timeout,
-        allow_get_fallback=args.allow_get_fallback,
-    )
-    client.login()
-    args.func(args, client)
+        if args.host:
+            host = normalize_host(args.host)
+            client = build_client(args, host)
+            client.login()
+            args.selected_host = host
+            args.func(args, client)
+            return
+
+        host, client, _ = locate_vm_host(args)
+        args.selected_host = host
+        args.func(args, client)
+    except ZStackOpError as exc:
+        print(exc.msg, file=sys.stderr)
+        if exc.status is not None:
+            print(f"HTTP status: {exc.status}", file=sys.stderr)
+        if exc.body is not None:
+            try:
+                print(f"Response: {exc.body.decode('utf-8')}", file=sys.stderr)
+            except Exception:
+                print(f"Response (raw): {exc.body}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

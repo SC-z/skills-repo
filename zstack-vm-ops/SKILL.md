@@ -12,15 +12,24 @@ description: 通过 ZStack REST API 执行虚拟机运维：查询 VM 状态/网
 ## 快速开始
 
 - 设置环境变量或直接传参：
-  - `ZSTACK_HOST`（默认8080端口，示例：`http://10.10.20.30:8080`）
-  - `ZSTACK_USERNAME`（默认：`admin`）
-  - `ZSTACK_PASSWORD`（默认：`password`，明文，脚本内部会做 SHA-512）
+  - `ZSTACK_HOST`（可选；显式指定单台 ZStack，支持 `http://10.10.20.30:8080` 或 `10.10.20.30`）
+  - `ZSTACK_USERNAME`（可选；未提供时默认使用 `admin`）
+  - `ZSTACK_PASSWORD`（可选；未提供时按主机使用内置密码：`10.10.20.22 -> letsg9`，`10.10.20.30/10.10.20.40 -> password`，明文，脚本内部会做 SHA-512）
+- 未指定 `--host` / `ZSTACK_HOST` 时，默认依次遍历：
+  - `10.10.20.22`
+  - `10.10.20.30`
+  - `10.10.20.40`
 - 运行脚本：`scripts/zstack_vm_ops.py`。
 - 注意：全局参数必须放在子命令前。
 
 ## 交互与默认策略
 
-- 先使用传入ip 使用默认账号密码：`admin/password`登陆，无法登入询问确认。
+- 优先使用用户传入的 `ZSTACK_HOST` / `--host`、`ZSTACK_USERNAME` / `--username`、`ZSTACK_PASSWORD` / `--password`。
+- 对已知主机存在内置默认凭据：`10.10.20.22 -> admin/letsg9`，`10.10.20.30 -> admin/password`，`10.10.20.40 -> admin/password`。
+- 用户未指定 IP 时，默认在 `10.10.20.22`、`10.10.20.30`、`10.10.20.40` 三台 ZStack 上遍历查找。
+- 查询类命令（`list-vms`、`list-l3`）会聚合三台主机结果，并在输出中附带 `host` 字段。
+- 变更类命令（开关机、增删改网卡）会先在三台主机中定位 VM；若同名 VM 同时出现在多台主机，必须改为显式指定 `--host`。
+- 变更类命令在自动发现模式下要求三台主机都可访问；若其中一台无法登录或查询，直接报错，避免误操作到错误环境。
 - 使用模糊匹配解析 VM 名称和 L3 网络：优先精确匹配，其次前缀匹配，再次包含匹配；匹配只保留最可能候选。
 - 只有当候选不止一个时才发起确认；需要确认时合并为一次问题（同时确认主机名与网段）。
 - 当用户只给出网段号或子网（如“170 网段”），通过 L3 列表的 `ipRanges` 或名称包含关系定位；唯一命中则直接使用。
@@ -36,36 +45,37 @@ description: 通过 ZStack REST API 执行虚拟机运维：查询 VM 状态/网
 ### 查询 VM 状态与网卡
 
 ```bash
-python3 scripts/zstack_vm_ops.py --host http://10.10.20.30:8080 \
+python3 scripts/zstack_vm_ops.py \
   --username admin --password password list-vms
 ```
 
-输出：JSON 列表，包含 `name`、`state` 和 `nics`（`name` 为 L3 网络名称，`ip` 为 IP 地址）。
+输出：JSON 列表，包含 `name`、`state`、`nics`，在未指定 `--host` 时额外包含 `host`（来源 ZStack 主机）。
 可选过滤：`--state Running`、`--name <vm-name>`。
+若只查单台主机，可显式追加 `--host 10.10.20.30`。
 
 ### 查询 L3 网络与网段
 
 ```bash
-python3 scripts/zstack_vm_ops.py --host http://10.10.20.30:8080 \
+python3 scripts/zstack_vm_ops.py \
   --username admin --password password list-l3
 ```
 
-输出：JSON 列表，包含 `name`、`uuid`、`ipRanges`。
+输出：JSON 列表，包含 `name`、`uuid`、`ipRanges`，在未指定 `--host` 时额外包含 `host`。
 可选过滤：`--name <l3-name>`。
 
 ### 开机 / 关机
 
 ```bash
-python3 scripts/zstack_vm_ops.py --host http://10.10.20.30:8080 \
+python3 scripts/zstack_vm_ops.py \
   --username admin --password password start-vm --vm-name polar1
 ```
 
 ```bash
-python3 scripts/zstack_vm_ops.py --host http://10.10.20.30:8080 \
+python3 scripts/zstack_vm_ops.py \
   --username admin --password password stop-vm --vm-name polar1 --type grace
 ```
 
-`--type` 支持 `grace` 或 `cold`。
+`--type` 支持 `grace` 或 `cold`。未指定 `--host` 时，会先在默认三台 ZStack 中定位 `polar1` 所在主机。
 
 ### 添加网卡（关机 -> 绑定 L3 -> 开机）
 

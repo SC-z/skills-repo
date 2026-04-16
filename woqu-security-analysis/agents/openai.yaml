@@ -1,0 +1,4 @@
+interface:
+  display_name: "安全加固分析"
+  short_description: "只用内部资料库比对安全加固项并生成本地MD报告"
+  default_prompt: "使用 $woqu-security-analysis 对客户安全加固清单做内部资料比对分析，并生成本地 Markdown 报告。"
